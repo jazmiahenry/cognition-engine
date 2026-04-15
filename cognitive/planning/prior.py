@@ -189,7 +189,7 @@ class HierarchicalPrior:
                 self.player_pos = obj.centroid
             return
 
-        # Find the object that moved with the largest displacement.
+        # Detect player by movement (largest displacement).
         best_id: Optional[int] = None
         best_dist: float = 0.0
         for obj_delta in getattr(delta, "object_deltas", []):
@@ -210,7 +210,6 @@ class HierarchicalPrior:
             if obj is not None:
                 self.player_pos = obj.centroid
 
-        # Update goal estimate whenever the scene changes.
         self.goal_pos = self._find_goal_pos(scene)
 
     def update_rules(self, rules: List) -> None:
@@ -379,9 +378,9 @@ class HierarchicalPrior:
         """Estimate goal location using saliency heuristics.
 
         A salient object is one that is:
-          - A unique color not shared by many other objects (uniqueness),
+          - A unique color not shared by many other objects,
           - Smaller than average (goals are often small targets), and
-          - Far from the player (otherwise it would have been reached).
+          - Far from the player.
 
         Args:
             scene: SceneGraph to search.
@@ -393,34 +392,25 @@ class HierarchicalPrior:
         if not objects:
             return None
 
-        # Count objects per color to measure uniqueness.
         color_count: Dict[int, int] = {}
         for obj in objects.values():
             color_count[obj.color] = color_count.get(obj.color, 0) + 1
 
         avg_area = sum(o.area for o in objects.values()) / len(objects)
-
         best_id: Optional[int] = None
         best_score: float = -float("inf")
 
         for oid, obj in objects.items():
             if oid == self.player_id:
-                continue  # skip self
+                continue
 
-            # Uniqueness: 1.0 for unique color, 0 for common.
             uniqueness = 1.0 / color_count[obj.color]
-
-            # Size saliency: small objects score higher.
             size_score = max(0.0, 1.0 - obj.area / (avg_area + 1))
-
-            # Distance from player (farther = potentially more interesting).
             dist_score = 0.0
             if self.player_pos is not None:
                 py, px = self.player_pos
                 cy, cx = obj.centroid
-                dist_score = (
-                    math.sqrt((cy - py) ** 2 + (cx - px) ** 2) / _GRID_DIAGONAL
-                )
+                dist_score = math.sqrt((cy - py) ** 2 + (cx - px) ** 2) / _GRID_DIAGONAL
 
             score = uniqueness * 0.5 + size_score * 0.3 + dist_score * 0.2
             if score > best_score:
@@ -428,7 +418,6 @@ class HierarchicalPrior:
                 best_id = oid
 
         if best_id is not None:
-            obj = objects[best_id]
-            return obj.centroid
+            return objects[best_id].centroid
 
         return None

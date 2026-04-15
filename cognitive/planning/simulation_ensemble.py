@@ -60,8 +60,6 @@ def _build_goal_fn(hypothesis: Dict, initial_state: MCTSState):
         return _goal
 
     if h_type == "click_all":
-        # Proxy: goal is reached when the object count drops below half the
-        # initial count, assuming clicks cause disappearances.
         n0 = max(1, initial_state.object_count())
         threshold = n0 // 2
         def _goal(state: MCTSState) -> bool:
@@ -69,14 +67,12 @@ def _build_goal_fn(hypothesis: Dict, initial_state: MCTSState):
         return _goal
 
     if h_type == "spatial_target":
-        # Without a known target layout we proxy with: state looks
-        # different from the initial state (any structural change).
         initial_hash = hash(initial_state)
         def _goal(state: MCTSState) -> bool:
             return hash(state) != initial_hash and state.object_count() > 0
         return _goal
 
-    # "maximize_change" and fallback: any state change is progress.
+    # "maximize_change" and fallback.
     initial_hash = hash(initial_state)
     def _default_goal(state: MCTSState) -> bool:
         return hash(state) != initial_hash
