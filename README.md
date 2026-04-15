@@ -13,11 +13,14 @@ Four-stage cognitive cascade — no neural networks, no LLMs, pure algorithmic r
 
 ### Key Design Decisions
 
-- **Hierarchical Prior** (Level 0: Spelke Core Knowledge, Level 1: empirical rules, Level 2: library transfer) solves cold-start — the agent is never random, even in fully novel environments
-- **Simulation Ensemble** — N MCTS trees x K sims, one per goal hypothesis, winner by root Q-value
-- **Click Actions in MCTS** — the tree reasons about clicking specific objects, not just cardinal movement
-- **Adaptive Exploration** — when MCTS Q-values are low, falls back to Explorer instead of wasting actions
-- **Probe Optimization** — 30-sim probe before committing full simulations; early-exit when world model has no traction
+- **Hierarchical Prior**
+  - Level 0: Core Knowledge module inspired by Spelke's Core Knowledge Framework
+  - Level 1: empirical rules
+  - Level 2: library transfer
+- **Simulation Ensemble**: N MCTS trees x K sims, one per goal hypothesis, winner by root Q-value
+- **Click Actions in MCTS**: the tree reasons about clicking specific objects, not just cardinal movement
+- **Adaptive Exploration**: when MCTS Q-values are low, falls back to Explorer instead of wasting actions
+- **Probe Optimization**: 30-sim probe before committing full simulations; early-exit when world model has no traction
 
 ## Dependencies
 
