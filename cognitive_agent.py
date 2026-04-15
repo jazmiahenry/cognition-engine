@@ -418,11 +418,14 @@ class CognitiveAgent(Agent):
         return action
 
     def _run_simulation_preplay(self) -> None:
-        """Run free actions on a simulation copy to build the world model.
+        """Multi-phase simulation proving ground.
 
-        Creates a separate game instance, explores it with _SIM_ACTIONS
-        steps, builds rules/prior/bayesian weights, then discards the
-        sim env. The learned knowledge transfers to the real game.
+        Phase 1 — Explore: build rules until saturation.
+        Phase 2 — Attempt: use MCTS to try solving the level in sim.
+        Phase 3 — Brute force: if MCTS fails, try systematic actions in sim.
+        Phase 4 — Collaborate: borrow rules from peers and retry.
+
+        Only strategies proven in simulation transfer to the real game.
         """
         import os
         op_mode = os.environ.get("OPERATION_MODE", "online")
@@ -438,7 +441,6 @@ class CognitiveAgent(Agent):
             logger.warning("Simulation preplay failed to create env: %s", e)
             return
 
-        # Capture available actions from sim env.
         if (self._available_action_ids is None
                 and getattr(sim_obs, 'available_actions', None)):
             self._available_action_ids = list(sim_obs.available_actions)
@@ -447,7 +449,6 @@ class CognitiveAgent(Agent):
         if not available:
             return
 
-        # Separate tracker for simulation.
         sim_tracker = ObjectTracker()
         raw = sim_obs.frame[0] if sim_obs.frame else None
         if raw is None:
@@ -457,15 +458,18 @@ class CognitiveAgent(Agent):
         prev_scene = segment_frame(prev_frame, min_size=2)
         prev_scene = sim_tracker.update(prev_scene)
 
+        # ------- Phase 1: Explore — build rules until saturation -------
+        _SAT_WINDOW = 20
         sim_actions = 0
-        for i in range(_SIM_ACTIONS):
-            # Pick action: cycle through available actions, intersperse clicks.
+        actions_since_new_rule = 0
+        prev_rule_count = 0
+
+        for i in range(200):
             if i < len(available):
                 action = available[i % len(available)]
             else:
                 action = random.choice(available)
 
-            # For click actions, target object centroids.
             data = {}
             if hasattr(action, 'is_complex') and action.is_complex():
                 objs = list(prev_scene.objects.values())
@@ -476,59 +480,206 @@ class CognitiveAgent(Agent):
                 else:
                     data = {'x': (i * 7) % 64, 'y': (i * 11) % 64}
 
-            try:
-                if data:
-                    sim_obs = sim_env.step(action, data=data)
-                else:
-                    sim_obs = sim_env.step(action)
-            except Exception:
+            prev_scene, sim_obs = self._sim_step(
+                sim_env, action, data, prev_scene, sim_tracker
+            )
+            if prev_scene is None:
                 continue
-
-            raw = sim_obs.frame[0] if sim_obs.frame else None
-            if raw is None:
-                continue
-
-            curr_frame = np.array(raw.tolist() if hasattr(raw, 'tolist') else raw, dtype=np.int32)
-            curr_scene = segment_frame(curr_frame, min_size=2)
-            curr_scene = sim_tracker.update(curr_scene)
-
-            # Feed observation into the real world model.
-            delta = compute_delta(prev_scene, curr_scene, action)
-            self.rule_engine.observe(action, prev_scene, curr_scene, delta)
-            self.prior.update_player(delta, curr_scene)
-            self.bayesian.update(curr_scene, delta, action)
-
-            self._colors_seen.update(o.color for o in curr_scene.objects.values())
-            action_name = getattr(action, 'name', '')
-            if action_name:
-                self._action_types_used.add(action_name)
-
-            prev_scene = curr_scene
             sim_actions += 1
 
-            # Stop if game over in simulation.
+            current_rule_count = len(self.rule_engine.rules)
+            if current_rule_count > prev_rule_count:
+                actions_since_new_rule = 0
+                prev_rule_count = current_rule_count
+            else:
+                actions_since_new_rule += 1
+
+            if actions_since_new_rule >= _SAT_WINDOW and sim_actions >= 30:
+                break
             if sim_obs.state in (GameState.WIN, GameState.GAME_OVER):
                 break
 
-        rules = self.rule_engine.get_high_confidence_rules()
-        self.prior.update_rules(rules)
+        rules_p1 = len(self.rule_engine.rules)
+        self.prior.update_rules(self.rule_engine.get_high_confidence_rules())
 
-        # Publish what we learned for other agents.
         self._shared_pool.publish(
             game_id=self.game_id,
-            rules=rules,
+            rules=self.rule_engine.get_high_confidence_rules(),
             colors_seen=self._colors_seen,
             action_types_used=self._action_types_used,
-            object_count=len(prev_scene.objects),
+            object_count=len(prev_scene.objects) if prev_scene else 0,
             levels_completed=self._levels_completed_internal,
+            available_action_ids=self._available_action_ids,
         )
 
+        # ------- Phase 2: Attempt — MCTS-guided solve in sim -------
+        phase2_solved = False
+        phase2_actions = 0
+        try:
+            sim_obs = sim_env.reset()
+            raw = sim_obs.frame[0] if sim_obs.frame else None
+            if raw is not None:
+                pf = np.array(raw.tolist() if hasattr(raw, 'tolist') else raw, dtype=np.int32)
+                prev_scene = segment_frame(pf, min_size=2)
+                prev_scene = sim_tracker.update(prev_scene)
+
+            for j in range(80):
+                goals = self.goal_inference.generate_hypotheses(
+                    prev_scene, self.rule_engine.observations
+                )
+                best_act, _, best_q = self.ensemble.run(
+                    scene=prev_scene, goal_hypotheses=goals,
+                    available_actions=available, n_trees=2, n_sims=100,
+                )
+                act = best_act if best_act and best_q >= 0.01 else random.choice(available)
+
+                d = {}
+                if isinstance(act, ClickAction):
+                    d = {'x': act.x, 'y': act.y}
+                    act = act.base_action
+                elif hasattr(act, 'is_complex') and act.is_complex():
+                    objs = list(prev_scene.objects.values())
+                    if objs:
+                        o = random.choice(objs)
+                        cy, cx = o.centroid
+                        d = {'x': int(round(cx)), 'y': int(round(cy))}
+
+                prev_scene, sim_obs = self._sim_step(
+                    sim_env, act, d, prev_scene, sim_tracker
+                )
+                phase2_actions += 1
+                if prev_scene is None:
+                    continue
+                if sim_obs.state == GameState.WIN:
+                    phase2_solved = True
+                    break
+                if sim_obs.state == GameState.GAME_OVER:
+                    break
+        except Exception:
+            pass
+
+        if phase2_solved:
+            logger.info(
+                "Sim preplay: %s SOLVED Phase2 (MCTS) — %d+%d actions, %d rules",
+                self.game_id, sim_actions, phase2_actions, len(self.rule_engine.rules),
+            )
+            return
+
+        # ------- Phase 3: Brute force in sim -------
+        phase3_solved = False
+        phase3_actions = 0
+        try:
+            sim_obs = sim_env.reset()
+            raw = sim_obs.frame[0] if sim_obs.frame else None
+            if raw is not None:
+                pf = np.array(raw.tolist() if hasattr(raw, 'tolist') else raw, dtype=np.int32)
+                prev_scene = segment_frame(pf, min_size=2)
+                prev_scene = sim_tracker.update(prev_scene)
+
+            objects = list(prev_scene.objects.values()) if prev_scene else []
+            simple = [a for a in available if not (hasattr(a, 'is_complex') and a.is_complex())]
+            clicks = [a for a in available if hasattr(a, 'is_complex') and a.is_complex()]
+            brute_list = list(simple)
+            for ob in objects:
+                for ca in clicks:
+                    brute_list.append((ca, ob))
+
+            for idx in range(min(len(brute_list), 100)):
+                entry = brute_list[idx]
+                d = {}
+                if isinstance(entry, tuple):
+                    act, ob = entry
+                    cy, cx = ob.centroid
+                    d = {'x': int(round(cx)), 'y': int(round(cy))}
+                else:
+                    act = entry
+
+                prev_scene, sim_obs = self._sim_step(
+                    sim_env, act, d, prev_scene, sim_tracker
+                )
+                phase3_actions += 1
+                if prev_scene is None:
+                    continue
+                if sim_obs.state == GameState.WIN:
+                    phase3_solved = True
+                    break
+                if sim_obs.state == GameState.GAME_OVER:
+                    break
+        except Exception:
+            pass
+
+        if phase3_solved:
+            logger.info(
+                "Sim preplay: %s SOLVED Phase3 (brute) — %d total, %d rules",
+                self.game_id, sim_actions + phase2_actions + phase3_actions,
+                len(self.rule_engine.rules),
+            )
+            return
+
+        # ------- Phase 4: Borrow from peers and retry -------
+        obj_count = len(prev_scene.objects) if prev_scene else 0
+        borrowed, score, donor = self._shared_pool.query_best_match(
+            game_id=self.game_id,
+            my_colors=self._colors_seen,
+            my_action_types=self._action_types_used,
+            my_object_count=obj_count,
+            my_available_action_ids=self._available_action_ids,
+            my_existing_rules=self.rule_engine.rules,
+        )
+        if borrowed:
+            noop_pairs: set = set()
+            for obs_a, bef, _, dl in self.rule_engine.observations:
+                if dl.is_noop:
+                    an = getattr(obs_a, 'name', str(obs_a))
+                    for ob in bef.objects.values():
+                        noop_pairs.add((an, ob.color))
+            existing = {(r.action_type, r.target_property, r.target_color)
+                        for r in self.rule_engine.rules}
+            added = 0
+            for rule in borrowed:
+                rk = (rule.action_type, rule.target_property, rule.target_color)
+                if rk in existing:
+                    continue
+                ra = rule.action_type if isinstance(rule.action_type, str) else str(rule.action_type)
+                if (ra, rule.target_color) in noop_pairs:
+                    continue
+                self.rule_engine.rules.append(rule)
+                existing.add(rk)
+                added += 1
+            if added > 0:
+                self.prior.update_rules(self.rule_engine.get_high_confidence_rules())
+                logger.info(
+                    "Sim Phase4: %s borrowed %d from %s (compat=%.3f)",
+                    self.game_id, added, donor, score,
+                )
+
         logger.info(
-            "Simulation preplay: %s ran %d free actions, learned %d rules, "
-            "player_id=%s, dominant=%s",
-            self.game_id, sim_actions, len(self.rule_engine.rules),
+            "Sim preplay: %s all phases — %d rules, player=%s, dominant=%s",
+            self.game_id, len(self.rule_engine.rules),
             self.prior.player_id, self.bayesian.get_dominant_module(),
         )
+
+    def _sim_step(self, sim_env, action, data, prev_scene, sim_tracker):
+        """Execute one step in simulation. Returns (new_scene, sim_obs)."""
+        try:
+            sim_obs = sim_env.step(action, data=data) if data else sim_env.step(action)
+        except Exception:
+            return None, None
+        raw = sim_obs.frame[0] if sim_obs.frame else None
+        if raw is None:
+            return None, sim_obs
+        cf = np.array(raw.tolist() if hasattr(raw, 'tolist') else raw, dtype=np.int32)
+        cs = segment_frame(cf, min_size=2)
+        cs = sim_tracker.update(cs)
+        delta = compute_delta(prev_scene, cs, action)
+        self.rule_engine.observe(action, prev_scene, cs, delta)
+        self.prior.update_player(delta, cs)
+        self.bayesian.update(cs, delta, action)
+        self._colors_seen.update(o.color for o in cs.objects.values())
+        an = getattr(action, 'name', '')
+        if an:
+            self._action_types_used.add(an)
+        return cs, sim_obs
 
     def _do_brute_force(self, scene: object, available: list) -> GameAction:
         """Systematic brute force: cycle through all actions deterministically.
